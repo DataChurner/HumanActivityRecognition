@@ -1,0 +1,497 @@
+---
+title: "Human Activity Recognition"
+author: "Kiran Joshi"
+date: "July 20, 2020"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Human Activity Recognition abbreviated as HAR is the main driver for a multimillion dollar fitness industry, as users would like to record and monitor the healthy lifestyles they lead. The raw data for this activity is obtained by accelerometers built into smart devices which collect the spacial coordinates if the device when an activity is performed with the smart device strapped to the arm of the user. This data collected as a time series is applied thru various transforms, to get the velocity,accelration and jerk values in the three coordinates.
+
+The data set that we have is an extract from 30 subjects for 6 activities
+
+
+1. WALKING
+2. WALKING_UPSTAIRS
+3. WALKING_DOWNSTAIRS
+4. SITTING
+5. STANDING
+6. LAYING
+
+
+We will try to predict these activities from the 561 predictors supplied to the model, and pick the right parameters to be supplied to get an accurate prediction with lowest error. We will also let the algorithm pick the variables of importance and report them. 
+
+## Analysis
+
+Lets load all the libraries required
+
+```{r libload,eval=TRUE,echo=FALSE,warning=FALSE,message=FALSE}
+library(data.table)
+library(caret)
+library(dplyr)
+library(doParallel)
+library(glmnet)
+library(party)
+library(knitr)
+
+```
+
+
+Create the train and validation data from the UCI dataset and further split the train data into train set and test set, so that we can use the validation data only to obtain the models final predictions 
+
+```{r fetchdata, echo=TRUE,eval=TRUE,warning=FALSE,message=FALSE}
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(dplyr)) install.packages("dplyr", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(doParallel)) install.packages("doParallel", repos = "http://cran.us.r-project.org")
+if(!require(glmnet)) install.packages("glmnet", repos = "http://cran.us.r-project.org")
+if(!require(party)) install.packages("party", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("knitr", repos = "http://cran.us.r-project.org")
+
+#create temp space
+dload <- tempfile()
+url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/00240/UCI%20HAR%20Dataset.zip"
+download.file(url, dload)
+
+#get column names
+cnames <- fread(text = readLines(unzip(dload,"UCI HAR Dataset/features.txt")), 
+                col.names = c("colId", "features"))
+#get activity names
+anames <- fread(text = readLines(unzip(dload,"UCI HAR Dataset/activity_labels.txt")), 
+                col.names = c("actId", "activity"))
+
+```
+### Observations and features cleanup
+
+Lets now see how many fatures we have to predict the human activity
+```{r dim}
+dim(cnames)
+```
+
+There are 561 observations, which is a lot of predictors, we have to short list them or rely on a model that does the feature selection for us.
+
+Now let us see if there are any duplicate feature names, given the number of features.
+If we do see a lot of duplicates, we may have to proceed with our analysis with feature indexes.
+
+```{r check}
+check <- as.data.frame(unique(cnames$features)) #get unique column names
+names(check) <- "features"
+# get a few duplicates
+check %>% left_join(cnames) %>% group_by(features) %>% summarize(n=n()) %>% filter(n>1) %>% head
+```
+
+There are a lot of duplicates, and hence we will not assign the names to the data set.
+
+Lets now get the train and validation data
+
+```{r getData}
+#get training data set into three objects
+#x containing the predictors
+#y containing the activites associated
+#sid contains the subject ID associated with the training data which can be used for grouping
+x_train <- fread(text = readLines(unzip(dload, "UCI HAR Dataset/train/X_train.txt")))
+y_train <- fread(text = readLines(unzip(dload, "UCI HAR Dataset/train/y_train.txt")),
+                 col.names = "activity")
+sid_train <- fread(text = readLines(unzip(dload,"UCI HAR Dataset/train/subject_train.txt")), 
+                   col.names = "subjectId")
+
+#now do the same for test data 
+#x containing the predictors
+#y containing the activites associated
+#sid contains the subject ID associated with the test data which can be used for grouping
+x_test <- fread(text = readLines(unzip(dload, "UCI HAR Dataset/test/X_test.txt")))
+y_test <- fread(text = readLines(unzip(dload, "UCI HAR Dataset/test/y_test.txt")),
+                col.names = "activity")
+sid_test <- fread(text = readLines(unzip(dload,"UCI HAR Dataset/test/subject_test.txt")),
+                  col.names = "subjectId")
+
+
+```
+
+The outcome is stored in a different table, and on inspection it is a multinominal categorical non ordinal data. Thus we need to convert the data into a factor with 6 levels.
+
+```{r factorize}
+#since y is categorical data, lets convert it into a factor
+y_train$activity <- as.factor(y_train$activity)
+y_test$activity <- as.factor(y_test$activity)
+```
+
+Now we are ready to combine it into a dataframe to be used in fitting of prediction models.
+
+```{r combine}
+#combine the x and y training and test data 
+data_train <- cbind(x_train,y_train) 
+data_valid <- cbind(x_test,y_test)
+#make sure activity is a factor
+class(data_train$activity)
+```
+
+Let us now observe the data and see if needs to be cleaned up
+
+```{r sample}
+head(data_train[,1:5])
+```
+
+Initial inspection of the data set shows that there are no NA values to be cleaned up, and that all data for the predictors has been standardized. Let us confirm that with the code below.
+
+```{r clean}
+x_list <- names(x_train)
+#if any column has data <-1 or >+1 or NA then mark Clean = "NO" else "YES"
+clean <- ifelse(sapply(x_list, function(x) 
+  any(data_train$x < -1 | data_train$x > 1 | is.na(data_train$x))),"NO", "YES")
+
+all(clean == "YES")
+```
+
+#### Observations on data
+
+1. There are no NA values that need to be imputed
+2. The range of the values in the predictors appears to have been standardized to vary between -1 and +1 
+3. The data seems to be tidy, as all the fatures are extracted thru transforms
+
+We will now split the train data into train set and test set as we will use the original test data as our validation data.
+
+```{r split}
+set.seed(1,sample.kind = "Rounding")
+test_ind <- createDataPartition(data_train$activity,times = 1,p=.2,list = FALSE)
+train_set <- data_train[-test_ind,]
+test_set <- data_train[test_ind,]
+```
+
+### Model Selection process
+
+From the understanding of the data, we have to go for a model that can predict multinominal outcomes.
+
+We have learnt that the **logistic regression** models are best suited for binomial predictions. We also know that we have too many predictors **561** which is a lot for simpler glm models. Hence we look out for regressions that not only performs minimization of error, but does feature selection as well.
+
+In my research, I did find three related models that caters to just our scenario, and we will evaluate them in detail now.
+
+#### Ridge / LASSO / ElasticNet Regressions
+
+Ridge regression is a regularization technique that drives the model coefficients to be small by adjusting the loss function to include a penalty term that is based on the coeffiecients. The ridge loss function includes a regularization hyperparameter __$\alpha$__ that determines how much weight should be placed on the penalty term. Different values of this hyperparameter will result in different models.
+
+\begingroup
+\center\fontsize{14}{16}\selectfont 
+__Goal: Minimize $Loss\left(\hat\beta_0, ..., \hat\beta_m\right) = \frac{1}{n} SSE + \lambda \sum_{i=1}^{m} \hat\beta_i^2$__
+\endgroup
+
+
+LASSO regression is also a regularization method that encourages small parameter values by adding a penalty term to the loss function. This penalty term has a slightly different form from the one encountered in ridge regression.
+
+
+\begingroup
+\center\fontsize{14}{16}\selectfont 
+__Goal: Minimize $Loss\left(\hat\beta_0, ..., \hat\beta_m\right) = \frac{1}{n} SSE + \lambda \sum_{i=1}^{m} | \hat\beta_i |$__
+\endgroup
+
+
+
+Elasticnet is a combination of both Ridge and LASSO, and and uses the __$\alpha$__ value to pick a regression between LASSO and Ridge When __$\alpha$__ is 0, the second term becomes 0 and hence becomes a Ridge model, and when __$\alpha$__ is set to 1, the first term becomes 0 and the model translates to LASSO 
+
+
+\begingroup
+\center\fontsize{14}{16}\selectfont
+__Goal: $\min_{\beta_0, \beta \in {R}^{p+1}} \frac{1}{2N} \sum_{i = 1}^{N} \left( y_i - \beta_0 - x_i^T \beta \right)^2 + \lambda \left[ \left(1 - \alpha \right) \frac{\left \lVert \beta \right \rVert_{2}^{2}}{2} + \alpha \left \lVert \beta \right \rVert_{1} \right]$__
+\endgroup
+
+
+These models are very expensive on the laptop, and takes a long time to train, thus two choices have been provided
+
+1. The user can answer "Y" for the question, and We can cluster the R environment to run the train on all the CPU's of the computer and then coalesce the results.
+
+2. The peer reviewer may be interested in just testing out the model and may not have the time to train, in which case there is a questionaire and if the reviewer puts in a "N", it looks for three models in the working directory, that can be downloaded from my google drive - [Download Here](https://drive.google.com/drive/folders/1BEpMB_7cgVT3JSgxU6sSVaxWwx2ztqjc?usp=sharing).
+ 
+ 
+
+```{r TrainModels, echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+musttrain <- ""
+musttrain <- as.character(readline(prompt="Enter Y - if you want to Train or
+             N - if you want to load model from saved rds file provided : "))
+if(toupper(musttrain) == "Y") {
+     
+#set up a Ridge model
+control <- trainControl(method = "repeatedcv",
+                        number = 10,
+                        repeats = 5)
+#since the data is regularized, the weights applied are very close to zero for 
+#highest accuracy
+grid <- expand.grid(alpha=0, #set to 0 for ridge model
+                    lambda=10^-5)
+
+#make a cluster of number of processors -1
+cl <- makePSOCKcluster(7)
+registerDoParallel(cl)
+
+#Ridge model
+
+set.seed(1,sample.kind = "Rounding")
+
+ridge_model <- train(activity~.,
+                     train_set,
+                     method = "glmnet",
+                     tuneGrid = grid,
+                     trControl = control)
+
+
+
+#Lasso model
+
+grid <- expand.grid(alpha=1, #set to 1 for lasso model
+                    lambda=10^-5)
+
+set.seed(1,sample.kind = "Rounding")
+
+lasso_model <- train(activity~.,
+                     train_set,
+                     method = "glmnet",
+                     tuneGrid = grid,
+                     trControl = control)
+
+#Elasticnet model
+
+grid <- expand.grid(alpha=seq(0,1,length=10), #set 0 to 1 for Elastic model
+                    lambda=10^-5)
+
+set.seed(1,sample.kind = "Rounding")
+
+elastic_model <- train(activity~.,
+                     train_set,
+                     method = "glmnet",
+                     tuneGrid = grid,
+                     trControl = control)
+##stop cluster
+stopCluster(cl)
+
+#saving the three models
+saveRDS(ridge_model,"Ridge_model.rds")
+saveRDS(lasso_model,"Lasso_model.rds")
+saveRDS(elastic_model,"Elastic_model.rds")
+
+}
+#load models
+if(toupper(musttrain) == "N") {
+  ridge_model <-readRDS("Ridge_model.rds")
+  lasso_model <-readRDS("Lasso_model.rds")
+  elastic_model <-readRDS("Elastic_model.rds")
+}
+```
+
+```{r LoadModels}
+  ridge_model <-readRDS("Ridge_model.rds")
+  lasso_model <-readRDS("Lasso_model.rds")
+  elastic_model <-readRDS("Elastic_model.rds")
+```
+
+Lets now Analyze the different models and see which would be a good model to adapt.
+
+
+```{r RidgeModelAnalysis}
+#get the details from the model
+ridge_model
+
+#as we can see the highest accuracy is obtained with the lowest lambda
+plot(ridge_model)
+
+
+#get the variables of importance
+plot(varImp(ridge_model,scale = TRUE),top = 10)
+
+```
+
+We see from the first plot that the highest accuracy of **96.9 %**is obtained from the lowest lambda.
+and from the second plot we see that for for activities 2,3 and 4 (walking upstairs,downstairs and sitting) the most important predictor is V2 and V3
+
+Lets analyze the Lasso model now
+
+
+```{r LASSOModelAnalysis }
+#get the details from the model
+lasso_model
+
+plot(lasso_model)
+
+#get the variables of importance
+varImp(lasso_model)
+plot(varImp(lasso_model,scale = TRUE),top = 10)
+
+```
+
+The highest accuracy of **98.53 %**is obtained from the lowest lambda.
+and from the second plot that similarly for for activities 2,3 and 4 (walking upstairs,downstairs and sitting) the most important predictor is V2 and V3.
+
+
+```{r ElasticNetModelAnalysis}
+
+#get the details from the model
+elastic_model
+
+plot(elastic_model)
+
+#get the variables of importance
+varImp(elastic_model)
+plot(varImp(elastic_model,scale = TRUE),top = 10)
+
+
+```
+
+
+We can also compare the different models by using the resampling feature of the caret package and merge the results into one pane for easier contrast.
+
+```{r EasyContrast}
+#we can compare the models by combining them to an array and listing out 
+#their properties.
+models <- list(ridge = ridge_model,lasso = lasso_model,elastic = elastic_model)
+resample <- resamples(models)
+summary(resample)
+
+```
+
+We can see that the Elastic model had the max accuracy of **99.66 %** which is a nice to have in the predictive world.
+
+
+Till now we have only dealt with the Train set of data and obtained the accuracies of the model. Let us now apply the model on the Test set and obtain the accuracies to make sure that the model we are about to pick would generate good results from data that was not used for training.
+
+```{r TestData}
+#Using the test set to predict accuracy
+#ridge accuracy
+ridge_predict <- predict(ridge_model,test_set)
+mean(as.numeric(as.character((ridge_predict))) == 
+     as.numeric(as.character(test_set$activity)))
+
+#lasso accuracy
+lasso_predict <- predict(lasso_model,test_set)
+mean(as.numeric(as.character((lasso_predict))) == 
+     as.numeric(as.character(test_set$activity)))
+
+#elasticnet accuracy
+elastic_predict <- predict(elastic_model,test_set)
+mean(as.numeric(as.character((elastic_predict))) == 
+     as.numeric(as.character(test_set$activity)))
+
+```
+
+The Elastic Model tops the list with **99.3 %** accuracy 
+
+Let us now check to see where the errors are, for that we will use the confusion matrix and see where the predictions went wrong.
+
+```{r errors}
+#confusion matricies
+cm_ridge <- confusionMatrix(ridge_predict,test_set$activity)
+#ridge cm
+cm_ridge$table
+#ridge error (misclassification %)
+1-sum(diag(cm_ridge$table))/sum(cm_ridge$table)
+
+cm_lasso <- confusionMatrix(lasso_predict,test_set$activity)
+#lasso cm
+cm_lasso$table
+#lasso error (misclassification %)
+1-sum(diag(cm_lasso$table))/sum(cm_lasso$table)
+
+cm_elastic <- confusionMatrix(elastic_predict,test_set$activity)
+#elastic cm
+cm_elastic$table
+#elastic error (misclassification %)
+1-sum(diag(cm_elastic$table))/sum(cm_elastic$table)
+
+```
+
+From what we can see, all the three models have struggled with predicting standing (activity 5), This may be due to the fact that there are too many variables of importance that are contributing to the prediction of activity 5.
+
+The errors have been minimal for the Elastic Model as expected. 
+
+Considering all the exploratory analysis we have done so far, we are now comfortable to pick the best fit of the Elastic model
+
+We can use the coefficients from the best model to get an idea about the predictors considered for the various activities
+
+```{r predictors}
+#picking the model
+elastic_model$bestTune
+elastic_best <- elastic_model$finalModel
+coefficients <- coef(elastic_best,s=elastic_model$bestTune$lambda)
+predictor <- data.frame(predictors = names(coefficients[[1]][,1]),
+                      y1 = coefficients[[1]][,1],y2 = coefficients[[2]][,1],
+                      y3 = coefficients[[3]][,1],y4 = coefficients[[4]][,1],
+                      y5 = coefficients[[5]][,1],y6 = coefficients[[6]][,1])
+
+head(predictor)
+```
+
+The predictions can be obtained by multiplying the predictor value with their coefficients and summing them all up with the intercept value. 
+
+### Decision Tree
+
+If we would have approached the problem with decision trees instead of logistic methods, we would have arrrived at a classification based on the value of the predictor being lesser than or greater than certain values to make our decision trees, and then prune it to a desired number of branches to base our predictions.
+
+I have provided a small example to compare and contrast the two methodologies.
+
+```{r tree}
+#plot decision tree
+#we will now use ctree from the party package to view the decision tree
+#we have used some pruning parameters to make the tree look pretty
+# this is for an example purpose only and not actually used for modelling
+tree <- ctree(activity~.,data = test_set,controls = ctree_control(mincriterion = 0.99,
+                                                                  minsplit = 400))
+plot(tree)
+```
+
+As we can see from the bar graphs shown at the bottom nodes, some activities are relatively easy to predict just with a few variables. The errors in this particular case is very high.
+
+
+Now we are ready to do our run on the validataion data set (which we have not used for training or testing our models) and get the accuracy of predictions.
+
+### Validation
+
+```{r results}
+#Result
+#validation set checks
+elastic_predict_valid <- predict(elastic_model,data_valid)
+#elastic accuracy 
+mean(as.numeric(as.character((elastic_predict_valid))) == 
+                as.numeric(as.character(data_valid$activity)))
+#create confusion matrix
+cm_elastic_valid <- confusionMatrix(elastic_predict_valid,data_valid$activity)
+#elastic cm
+cm_elastic_valid$table
+#error (misclassification)
+1-sum(diag(cm_elastic_valid$table))/sum(cm_elastic_valid$table)
+```
+
+## Results
+
+We have obtained an accuracy of **95.65 %** on the validation set. This confirms no over training and an adequate model to present the results.
+
+The confusion matrix shows that the model had some challenges with the classification of Standing activity, and that again may be due to too many predictor identified to be responsible for more than 90% of the predictability of the activity.
+
+We can probably better the results marginally by running the cross-validation against the validation set, but since no operation was allowed on the validation set, the final results are as presented. 
+
+## Conclusion
+
+From the various models applied on the HAR(Human Activity Recognition) data, we were able to classify the activities with an accuracy of **95.65 %** which is a significant value for machine learning modules.
+We were able to achieve this by evaluating the various techniques available for multivariate classification, and fine tuning them with cross validation and regression methods that would minimize the prediction errors. 
+
+We have also explored setting up clusters for incorporating a fit and train a model for data that had a large value of predictors. The models are also provided as a RDS objects, which could be used to perform peer reviews, and can be downloaded from the link provided.
+
+
+[Download Here](https://drive.google.com/drive/folders/1BEpMB_7cgVT3JSgxU6sSVaxWwx2ztqjc?usp=sharing)
+
+
+
+Some of the other methodology tried to pick the effects failed due to the nature and size of information provided for analysis which include linear regression, k - nearest neighbor and random forest.
+
+
+
+## References
+
+Ridge and Lasso regression:
+http://www.sthda.com/english/articles/37-model-selection-essentials-in-r/153-penalized-regression-essentials-ridge-lasso-elastic-net/
+
+
